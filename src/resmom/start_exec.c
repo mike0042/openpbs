@@ -60,6 +60,7 @@
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <pmix_server.h>
 
 #if defined(__osf__)
 #include <stropts.h>
@@ -96,6 +97,7 @@
 #include "placementsets.h"
 #include "pbs_internal.h"
 #include "pbs_reliable.h"
+#include "mom_pmix.h"
 
 #define	PIPE_READ_TIMEOUT	5
 #define EXTRA_ENV_PTRS	       32
@@ -1943,6 +1945,125 @@ generate_pbs_nodefile(job *pjob, char *nodefile, int nodefile_sz,
 	return (0);
 }
 
+/* XXX */
+#if 1
+typedef struct {
+	vmpiprocs *vnode;
+	int nextrank;
+} pbs_pmix_map_t;
+
+/*
+ * Construct a map of the vnodes and ranks that will be
+ * provided to PMIx.
+ *
+ * nodes looks like: host0,host1,...,hostN
+ * ppn looks like: 0,100,200;1,101,201;...
+ *
+ * Order of nodes and ppn must match.
+ */
+int
+pbs_pmix_gen_map(job *pjob, char **node, char **ppn)
+{
+	int i, j, len, nodelen, ppnlen;
+	pbs_pmix_map_t *map;
+	char *pn, *pp, *pdot;
+
+	if (!node || !ppn)
+		return -1;
+	map = calloc(pjob->ji_numvnod, sizeof(pbs_pmix_map_t));
+	for (i = 0; i < pjob->ji_numvnod; i++) {
+		map[i].vnode = &pjob->ji_vnods[i];
+		map[i].nextrank = i;
+	}
+	nodelen = 0;
+	ppnlen = 0;
+	for (i = 0; i < pjob->ji_numvnod; i++) {
+		/* If this is the first rank, add it unconditionally */
+		if (i == 0) {
+			if ((pdot = strchr(map[i].vnode->vn_host->hn_host, '.')) != NULL)
+				len = pdot - map[i].vnode->vn_host->hn_host;
+			else
+				len = strlen(map[i].vnode->vn_host->hn_host);
+			nodelen += len;
+			nodelen++;
+			ppnlen += (i % 10) + 1;
+			ppnlen++;
+		}
+		/* Add subsequent ranks when necessary */
+		for (j = i + 1; j < pjob->ji_numvnod; j++) {
+			if (strcmp(map[i].vnode->vn_hname, map[j].vnode->vn_hname) == 0) {
+				map[i].nextrank = j;
+				break;
+			}
+			if ((pdot = strchr(map[i].vnode->vn_host->hn_host, '.')) != NULL)
+				len = pdot - map[i].vnode->vn_host->hn_host;
+			else
+				len = strlen(map[i].vnode->vn_host->hn_host);
+			nodelen += len;
+			nodelen++;
+			ppnlen += (i % 10) + 1;
+			ppnlen++;
+		}
+	}
+	if (!nodelen || !ppnlen) {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"%s: zero length node list", __func__);
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
+		return -1;
+	}
+	snprintf(log_buffer, sizeof(log_buffer),
+		"%s: Allocating %d bytes for node list", __func__, nodelen);
+	log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid, log_buffer);
+	*node = malloc(nodelen);
+	pn = *node;
+	*pn = '\0';
+	snprintf(log_buffer, sizeof(log_buffer),
+		"%s: Allocating %d bytes for ppn list", __func__, ppnlen);
+	log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid, log_buffer);
+	*ppn = malloc(ppnlen);
+	pp = *ppn;
+	*pp = '\0';
+	for (i = 0; i < pjob->ji_numvnod; i++) {
+		if (map[i].nextrank < 0)
+			continue;
+		if ((pdot = strchr(map[i].vnode->vn_host->hn_host, '.')) != NULL)
+			len = pdot - map[i].vnode->vn_host->hn_host;
+		else
+			len = strlen(map[i].vnode->vn_host->hn_host);
+		if (pn != *node) {
+			sprintf(pn, ",");
+			pn++;
+		}
+		snprintf(pn, len + 1, "%s", map[i].vnode->vn_host->hn_host);
+		pn += len;
+		j = i;
+		if (pp != *ppn) {
+			sprintf(pp, ";");
+			pp++;
+		}
+		sprintf(pp, "%d", j);
+		pp += (j % 10) + 1;
+		if (j == map[j].nextrank)
+			continue;
+		j = map[j].nextrank;
+		while (j >= 0) {
+			int prev;
+			sprintf(pp, ",%d", j);
+			pp += (i % 10) + 2;
+			if (j == map[j].nextrank)
+				break;
+			prev = j;
+			j = map[j].nextrank;
+			map[prev].nextrank = -1;
+		}
+	}
+	return 0;
+}
+#endif
+
 /**
  * @brief
  *	Read a piece of data from 'downfds' pipe of size 'data_size'.
@@ -2314,7 +2435,7 @@ get_failed_moms_and_vnodes(job *pjob, int pipefd, int prolo_pipefd, vnl_t **vnl_
 	/* now prune_exec_vnode taking away vnodes managed by moms
 	 * in job's node_fail_list, and also satisfy the original
 	 * job schedselect
-         */
+	 */
 	if (prune_exec_vnode(pjob, NULL, vnl_fails, vnl_good, err_msg, LOG_BUF_SIZE) != 0) {
 		return (1);
 	}
@@ -2915,6 +3036,15 @@ finish_exec(job *pjob)
 	FILE			*temp_stderr = stderr;
 	vnl_t			*vnl_fails = NULL;
 	vnl_t			*vnl_good = NULL;
+	pmix_status_t pstat;
+	pmix_proc_t pproc;
+	pmix_info_t *pinfo;
+	pbs_pmix_lock_t pmix_lock;
+	char *pmix_node_list = NULL;
+	char *pmix_ppn_list = NULL;
+	char *pmix_node_regex;
+	char *pmix_ppn_regex;
+	int rc;
 
 	ptc = -1; /* No current master pty */
 
@@ -3223,10 +3353,86 @@ finish_exec(job *pjob)
 	pjob->ji_qs.ji_stime = time_now;
 	pjob->ji_sampletim  = time_now;
 
+	/* XXX */
+#if 1
+	rc = pbs_pmix_gen_map(pjob, &pmix_node_list, &pmix_ppn_list);
+	if (rc != 0) {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"Failed to generate PMIx mapping");
+		exec_bail(pjob, JOB_EXEC_RETRY, log_buffer);
+		return;
+	}
+	snprintf(log_buffer, sizeof(log_buffer),
+		"PMIX nodes: %s", pmix_node_list);
+	log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid, log_buffer);
+	snprintf(log_buffer, sizeof(log_buffer),
+		"PMIX ppn: %s", pmix_ppn_list);
+	log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid, log_buffer);
+	/* Generate the regex */
+	PMIx_generate_regex(pmix_node_list, &pmix_node_regex);
+	PMIx_generate_ppn(pmix_ppn_list, &pmix_ppn_regex);
+	free(pmix_node_list);
+	free(pmix_ppn_list);
+#endif
+	PMIX_INFO_CREATE(pinfo, 4);
+	{
+		int i = 1;
+		PMIX_INFO_LOAD(&pinfo[0], PMIX_UNIV_SIZE, &i, PMIX_UINT32);
+		PMIX_INFO_LOAD(&pinfo[1], PMIX_JOB_SIZE, &i, PMIX_UINT32);
+		PMIX_INFO_LOAD(&pinfo[2], PMIX_NODE_MAP, pmix_node_regex, PMIX_STRING);
+		PMIX_INFO_LOAD(&pinfo[3], PMIX_PROC_MAP, pmix_ppn_regex, PMIX_STRING);
+	}
+	PBS_PMIX_CONSTRUCT_LOCK(&pmix_lock);
+	pstat = PMIx_server_register_nspace(pjob->ji_qs.ji_jobid,
+					1, pinfo, 4,
+					pbs_pmix_wait_cb,
+					(void *)&pmix_lock);
+	PBS_PMIX_WAIT_THREAD(&pmix_lock);
+	PBS_PMIX_DESTRUCT_LOCK(&pmix_lock);
+	PMIX_INFO_FREE(pinfo, 4);
+	if (pstat != PMIX_SUCCESS) {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"Failed to register PMIx namespace: %s",
+			PMIx_Error_string(pstat));
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
+	} else {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"PMIx namespace registered");
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
+	}
+	PMIX_LOAD_PROCID(&pproc, pjob->ji_qs.ji_jobid, 0);
+	PBS_PMIX_CONSTRUCT_LOCK(&pmix_lock);
+	pstat = PMIx_server_register_client(&pproc,
+			pjob->ji_qs.ji_un.ji_momt.ji_exuid,
+			pjob->ji_qs.ji_un.ji_momt.ji_exgid,
+			NULL, pbs_pmix_wait_cb, (void *)&pmix_lock);
+	PBS_PMIX_WAIT_THREAD(&pmix_lock);
+	PBS_PMIX_DESTRUCT_LOCK(&pmix_lock);
+	if (pstat != PMIX_SUCCESS) {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"Failed to register PMIx client: %s",
+			PMIx_Error_string(pstat));
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
+	} else {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"PMIx client registered");
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
+	}
+
 	/*
 	 ** Fork the child process that will become the job.
 	 */
 	cpid = fork_me(-1);
+	snprintf(log_buffer, sizeof(log_buffer),
+		"fork_me returned %ld", (long)cpid);
+	log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid, log_buffer);
 	if (cpid > 0) {
 		conn_t *conn = NULL;
 		char	*s, *d, holdbuf[2*MAXPATHLEN+5];
@@ -3536,11 +3742,39 @@ finish_exec(job *pjob)
 	vtable.v_ensize = vstrs->as_usedptr + num_var_else + num_var_env +
 		EXTRA_ENV_PTRS;
 	vtable.v_used   = 0;
-	vtable.v_envp = (char **)malloc(vtable.v_ensize * sizeof(char *));
+	vtable.v_envp = (char **)calloc(vtable.v_ensize, sizeof(char *));
 	if (vtable.v_envp == NULL) {
 		log_err(ENOMEM, __func__, "out of memory");
 		starter_return(upfds, downfds, JOB_EXEC_FAIL1, &sjr);
 	}
+
+	/* XXX */
+#if 1
+	{
+		char **pmixenv = NULL;
+		// char **p;
+		// int i;
+
+		// pstat = PMIx_server_setup_fork(&pproc, &vtable.v_envp);
+		pstat = PMIx_server_setup_fork(&pproc, &pmixenv);
+		if (pstat != PMIX_SUCCESS) {
+			snprintf(log_buffer, sizeof(log_buffer),
+				"Failed to setup PMIx server fork: %s",
+				PMIx_Error_string(pstat));
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+				pjob->ji_qs.ji_jobid, log_buffer);
+		} else {
+			snprintf(log_buffer, sizeof(log_buffer),
+				"PMIx server setup fork complete");
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+				pjob->ji_qs.ji_jobid, log_buffer);
+		}
+		// for (i = 0, p = vtable.v_envp; *p; p++, i++);
+		// vtable.v_used = i;
+		for (j = 0; pmixenv[j]; j++)
+			bld_env_variables(&vtable, pmixenv[j], NULL);
+	}
+#endif
 
 	/*  First variables from the local environment */
 
@@ -6326,7 +6560,7 @@ fork_me(int conn)
 		(void)mom_close_poll();
 		net_close(conn);	/* close all but for the current */
 	} else if (pid < 0)
-		log_err(errno, "fork_me", "fork failed");
+		log_err(errno, __func__, "fork failed");
 
 	return (pid);
 }

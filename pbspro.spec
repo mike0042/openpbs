@@ -105,6 +105,7 @@ BuildRequires: libedit-devel
 BuildRequires: libical-devel
 BuildRequires: ncurses-devel
 BuildRequires: perl
+BuildRequires: pmix
 BuildRequires: postgresql-devel >= 9.1
 BuildRequires: postgresql-contrib >= 9.1
 BuildRequires: python-devel >= 2.6
@@ -151,6 +152,7 @@ Conflicts: pbs-mom
 Conflicts: pbs-cmds
 Requires: bash
 Requires: expat
+Requires: pmix
 Requires: postgresql-server >= 9.1
 Requires: postgresql-contrib >= 9.1
 Requires: python >= 2.6
@@ -188,6 +190,7 @@ Conflicts: pbs-mom
 Conflicts: pbs-cmds
 Requires: bash
 Requires: expat
+Requires: pmix
 Requires: python >= 2.6
 Requires: python < 3.0
 %if 0%{?suse_version} >= 1500

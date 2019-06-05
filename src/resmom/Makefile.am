@@ -62,7 +62,8 @@ pbs_mom_LDADD = \
 	@mom_mach_libs@ \
 	@libz_lib@ \
 	-lssl \
-	-lcrypto
+	-lcrypto \
+	-lpmix
 
 pbs_mom_SOURCES = \
 	$(top_builddir)/src/lib/Libattr/job_attr_def.c \
@@ -87,6 +88,8 @@ pbs_mom_SOURCES = \
 	mom_hook_func.c \
 	mom_inter.c \
 	mom_main.c \
+	mom_pmix.c \
+	mom_pmix.h \
 	mom_server.c \
 	mom_vnode.c \
 	mom_walltime.c \

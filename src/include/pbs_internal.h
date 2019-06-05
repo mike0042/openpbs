@@ -398,8 +398,12 @@ enum accrue_types {
 #endif
 #endif
 
+#if 0
 #if !defined(C99) && !defined(__cplusplus) 
 typedef enum { false, true } bool;
+#else
+#include "stdbool.h"
+#endif
 #else
 #include "stdbool.h"
 #endif

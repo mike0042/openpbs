@@ -80,6 +80,7 @@
 #include	<limits.h>
 #include	<sys/types.h>
 #include	<sys/stat.h>
+#include	<pmix_server.h>
 
 #include	"libpbs.h"
 #include	"pbs_ifl.h"
@@ -123,6 +124,7 @@
 #include	"mom_mach.h"
 #endif	/* MOM_CSA or MOM_ALPS */
 #include	"pbs_reliable.h"
+#include	"mom_pmix.h"
 
 #define STATE_UPDATE_TIME 10
 #ifndef	PRIO_MAX
@@ -9723,6 +9725,29 @@ main(int argc, char *argv[])
 	initialize();
 #endif	/* WIN32 */
 
+	/* XXX */
+	{
+		pmix_status_t pstat;
+		pmix_server_module_t mymodule = {
+			/* v1x interfaces */
+			.client_connected = pbs_pmix_client_connected,
+			.client_finalized = pbs_pmix_client_finalized,
+			.abort = NULL
+		};
+
+		pstat = PMIx_server_init(&mymodule, NULL, 0);
+		if (pstat != PMIX_SUCCESS) {
+			log_event(PBSEVENT_ERROR, PBS_EVENTCLASS_SERVER,
+				LOG_DEBUG, msg_daemonname,
+				"Could not initialize PMIx server");
+			sprintf(log_buffer, "PMIx error: %s", PMIx_Error_string(pstat));
+		} else {
+			log_event(PBSEVENT_ERROR, PBS_EVENTCLASS_SERVER,
+				LOG_DEBUG, msg_daemonname,
+				"PMIx server initialized");
+		}
+        }
+
 	/*
 	 * Now at last, we are ready to do some work, the following section
 	 * constitutes the "main" loop of MOM
@@ -10237,6 +10262,10 @@ main(int argc, char *argv[])
 	}
 
 	cleanup();
+
+	/* XXX */
+	PMIx_server_finalize();
+
 	log_event(PBSEVENT_SYSTEM | PBSEVENT_FORCE, PBS_EVENTCLASS_SERVER,
 		LOG_NOTICE, msg_daemonname, "Is down");
 	log_close(1);
