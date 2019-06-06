@@ -3376,22 +3376,72 @@ finish_exec(job *pjob)
 	free(pmix_node_list);
 	free(pmix_ppn_list);
 #endif
-	PMIX_INFO_CREATE(pinfo, 4);
+	PMIX_INFO_CREATE(pinfo, 12);
 	{
-		int i = 1;
-		PMIX_INFO_LOAD(&pinfo[0], PMIX_UNIV_SIZE, &i, PMIX_UINT32);
-		PMIX_INFO_LOAD(&pinfo[1], PMIX_JOB_SIZE, &i, PMIX_UINT32);
-		PMIX_INFO_LOAD(&pinfo[2], PMIX_NODE_MAP, pmix_node_regex, PMIX_STRING);
-		PMIX_INFO_LOAD(&pinfo[3], PMIX_PROC_MAP, pmix_ppn_regex, PMIX_STRING);
+		uint32_t i = 1;
+		int n = 0;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_UNIV_SIZE, &i, PMIX_UINT32);
+		++n;    // NOTE: cannot put increment in macro!
+		/* the max number of procs the user is allowed to start within
+		 * this allocation - usually the same as univ_size */
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_MAX_PROCS, &i, PMIX_UINT32);
+		++n;
+		/* number of procs being spawned in this job - note that this
+		 * again is a value PMIx could compute from the proc_map */
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_JOB_SIZE, &i, PMIX_UINT32);
+		++n;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_NODE_MAP, pmix_node_regex, PMIX_STRING);
+		++n;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_PROC_MAP, pmix_ppn_regex, PMIX_STRING);
+		++n;
+		i = 0;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_SPAWNED, &i, PMIX_UINT32);
+		++n;
+		i = 1; 		// change to number of local procs
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_LOCAL_SIZE, &i, PMIX_UINT32);
+		++n;
+		/* since we only have one "job"/node, the node and local size
+		 * are the same. If you have more than one job/node, then the
+		 * node size is the total number of app procs running on the node */
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_NODE_SIZE, &i, PMIX_UINT32);
+		++n;
+		/* add the number of nodes - again, something PMIx itself could
+		 * compute from the node map */
+		i = pjob->ji_numvnod;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_NUM_NODES, &i, PMIX_UINT32);
+		++n;
+
+#if 0
+		/* add in the comma-delimited string of local ranks */
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_LOCAL_PEERS, ppnlocal, PMIX_STRING);
+		++n;
+		/* add in the value of the first rank in that list - again, something
+		 * PMIx can calculate on its own given the list */
+		pmix_rank_t rank = 0;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_LOCALLDR, &rank, PMIX_PROC_RANK);
+		++n;
+		/* add in the nodeid (i.e., the index into the node map) of my node */
+		i = mynodeid;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_NODEID, &i, PMIX_UINT32);
+		++n;
+#endif
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_JOBID, pjob->ji_qs.ji_jobid, PMIX_STRING);
+		++n;
+		i = 0;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_NPROC_OFFSET, &i, PMIX_UINT32);
+		++n;
+		/* add the number of different executables in this "job" */
+		i = 1;
+		PMIX_INFO_LOAD(&pinfo[n], PMIX_JOB_NUM_APPS, &i, PMIX_UINT32);
 	}
 	PBS_PMIX_CONSTRUCT_LOCK(&pmix_lock);
 	pstat = PMIx_server_register_nspace(pjob->ji_qs.ji_jobid,
-					1, pinfo, 4,
+					1, pinfo, 12,
 					pbs_pmix_wait_cb,
 					(void *)&pmix_lock);
 	PBS_PMIX_WAIT_THREAD(&pmix_lock);
 	PBS_PMIX_DESTRUCT_LOCK(&pmix_lock);
-	PMIX_INFO_FREE(pinfo, 4);
+	PMIX_INFO_FREE(pinfo, 12);
 	if (pstat != PMIX_SUCCESS) {
 		snprintf(log_buffer, sizeof(log_buffer),
 			"Failed to register PMIx namespace: %s",
