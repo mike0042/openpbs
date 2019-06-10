@@ -3378,8 +3378,13 @@ finish_exec(job *pjob)
 #endif
 	PMIX_INFO_CREATE(pinfo, 12);
 	{
-		uint32_t i = 1;
+		uint32_t i = pjob->ji_numvnod;
 		int n = 0;
+    snprintf(log_buffer, sizeof(log_buffer),
+			"PMIX_UNIV_SIZE: %d", i);
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
+    
 		PMIX_INFO_LOAD(&pinfo[n], PMIX_UNIV_SIZE, &i, PMIX_UINT32);
 		++n;    // NOTE: cannot put increment in macro!
 		/* the max number of procs the user is allowed to start within
