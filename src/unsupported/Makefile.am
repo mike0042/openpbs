@@ -40,7 +40,8 @@ unsupporteddir = ${exec_prefix}/unsupported
 
 unsupported_PROGRAMS = \
 	pbs_rmget \
-	pmix_client
+	pmix_client \
+	pmix_spawn
 
 dist_unsupported_SCRIPTS = \
 	pbs_diag \
@@ -85,3 +86,8 @@ pmix_client_LDADD = -lpmix
 pmix_client_SOURCES = \
 	pmix_client.h \
 	pmix_client.c
+
+pmix_spawn_LDADD = -lpmix
+
+pmix_spawn_SOURCES = \
+	pmix_spawn.c

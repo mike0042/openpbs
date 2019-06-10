@@ -3378,7 +3378,11 @@ finish_exec(job *pjob)
 #endif
 	PMIX_INFO_CREATE(pinfo, 4);
 	{
-		int i = 1;
+		int i = pjob->ji_numvnod;
+		snprintf(log_buffer, sizeof(log_buffer),
+			"PMIX_UNIV_SIZE: %d", i);
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid, log_buffer);
 		PMIX_INFO_LOAD(&pinfo[0], PMIX_UNIV_SIZE, &i, PMIX_UINT32);
 		PMIX_INFO_LOAD(&pinfo[1], PMIX_JOB_SIZE, &i, PMIX_UINT32);
 		PMIX_INFO_LOAD(&pinfo[2], PMIX_NODE_MAP, pmix_node_regex, PMIX_STRING);

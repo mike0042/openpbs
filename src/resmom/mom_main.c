@@ -9732,6 +9732,8 @@ main(int argc, char *argv[])
 			/* v1x interfaces */
 			.client_connected = pbs_pmix_client_connected,
 			.client_finalized = pbs_pmix_client_finalized,
+			.fence_nb = pbs_pmix_fence_nb,
+			.spawn = pbs_pmix_spawn,
 			.abort = NULL
 		};
 

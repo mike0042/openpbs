@@ -16,6 +16,27 @@ pbs_pmix_client_finalized(
 	pmix_op_cbfunc_t cbfunc,
 	void *cbdata);
 
+extern pmix_status_t
+pbs_pmix_fence_nb(
+	const pmix_proc_t proc[],
+	size_t procs,
+	const pmix_info_t info[],
+	size_t ninfo,
+	char *data,
+	size_t ndata,
+	pmix_modex_cbfunc_t cbfunc,
+	void *cbdata);
+
+extern pmix_status_t
+pbs_pmix_spawn(
+	const pmix_proc_t *proc,
+	const pmix_info_t job_info[],
+	size_t ninfo,
+	const pmix_app_t apps[],
+	size_t napps,
+	pmix_spawn_cbfunc_t cbfunc,
+	void *cbdata);
+
 extern void
 pbs_pmix_wait_cb(
 	pmix_status_t,
