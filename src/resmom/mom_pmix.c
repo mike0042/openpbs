@@ -58,6 +58,9 @@
 #include "list_link.h"
 #include "log.h"
 #include "tm.h"
+#include "net_connect.h"
+#include "rpp.h"
+#include "dis.h"
 
 extern char *log_file;
 extern char *path_log;
@@ -139,13 +142,55 @@ typedef struct {
 
 /**
  * @brief
+ * Utility function to print the PMIx rank provided including
+ * values with special meaning.
+ *
+ * @param[in] rank - value of rank to print
+ *
+ * @return char *
+ * @retval address of static buffer
+ */
+static char *
+rank2text(unsigned int rank)
+{
+	static char rankbuf[32];
+
+	switch (rank) {
+	case PMIX_RANK_UNDEF:
+		snprintf(rankbuf, sizeof(rankbuf), "PMIX_RANK_UNDEF");
+		break;
+	case PMIX_RANK_WILDCARD:
+		snprintf(rankbuf, sizeof(rankbuf), "PMIX_RANK_WILDCARD");
+		break;
+	case PMIX_RANK_LOCAL_NODE:
+		/* All ranks in any namespace on local node */
+		snprintf(rankbuf, sizeof(rankbuf), "PMIX_RANK_LOCAL_NODE");
+		break;
+	case PMIX_RANK_LOCAL_PEERS:
+		/* All ranks within namespace on local node */
+		snprintf(rankbuf, sizeof(rankbuf), "PMIX_RANK_LOCAL_PEERS");
+		break;
+	case PMIX_RANK_INVALID:
+		snprintf(rankbuf, sizeof(rankbuf), "PMIX_RANK_INVALID");
+		break;
+	default:
+		if (rank < PMIX_RANK_VALID)
+			snprintf(rankbuf, sizeof(rankbuf), "%u", rank);
+		else
+			snprintf(rankbuf, sizeof(rankbuf), "INTERNAL ERROR");
+	}
+	return rankbuf;
+}
+
+/**
+ * @brief
  * This callback function is invoked by the PMIx library after it
  * has been notified a process has exited.
  *
  * @param[in] status - exit status of the process
  * @param[in] cbdata - opaque callback data passed to the caller
  *
- * @retval void
+ * @return void
  *
  * @note
  * This function may be superfluous, in which case the call to
@@ -169,7 +214,7 @@ pbs_pmix_notify_exit_cb(pmix_status_t status, void *cbdata)
  * @param[in] exitstat - numeric exit status of the task
  * @param[in] msg - optional message supplied by the caller
  *
- * @retval void
+ * @return void
  */
 void
 pbs_pmix_notify_exit(job *pjob, int exitstat, char *msg)
@@ -386,8 +431,9 @@ pbs_pmix_abort(
 
 /**
  * @brief
- * At least one client called PMIx_Fence (blocking) or
- * PMIx_Fence_nb (non-blocking)
+ * All participating local clients have called PMIx_Fence (blocking) or
+ * PMIx_Fence_nb (non-blocking). If more participants are involved, call
+ * XXX to update the collective.
  *
  * @param[in] procs - array of client handle pointers
  * @param[in] nprocs - number of client handle pointers
@@ -431,42 +477,160 @@ pbs_pmix_fence_nb(
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
 	if (!proc) {
 		log_err(-1, __func__, "pmix_proc_t parameter is NULL");
-		return PMIX_ERROR;
+		return PMIX_ERR_BAD_PARAM;
 	}
 	if (!proc->nspace || (*proc->nspace == '\0')) {
 		log_err(-1, __func__, "Invalid PMIx namespace");
-		return PMIX_ERROR;
+		return PMIX_ERR_BAD_PARAM;
 	}
 	pjob = find_job((char *)proc->nspace);
 	if (!pjob) {
 		snprintf(log_buffer, sizeof(log_buffer),
 			"Job not found: %s", proc->nspace);
 		log_err(-1, __func__, log_buffer);
-		return PMIX_ERROR;
+		return PMIX_ERR_BAD_PARAM;
 	}
 	for (i = 0; i < nproc; i++) {
 		log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
 			"proc[%d].nspace = %s", i, proc[i].nspace);
 		log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
-			"proc[%d].rank = %u", i, (unsigned int)proc[i].rank);
+			"proc[%d].rank = %s", i,
+			rank2text((unsigned int)proc[i].rank));
 	}
-	for (i = 0; i < ninfo; i++) {
-		log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
-			"info[%d].key = %s", i, info[i].key);
-	}
+	/* Log the info array */
 	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
-			"There are %lu data entries", ndata);
-	/*
-	 * If MS, find/create the barrier for this job. Otherwise, send
-	 * a message to MS that a fence has been encountered. Once all
-	 * ranks have been accounted for, invoke the callback function.
-	 */
+			"Info count is %lu", ninfo);
+	for (i = 0; i < ninfo; i++) {
+		char *val;
+		pmix_status_t rc;
+
+		val = NULL;
+		rc = PMIx_Data_print(&val, NULL, (void *)&info[i].value,
+			info[i].value.type);
+		if (!val || (rc != PMIX_SUCCESS)) {
+			log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+				"info[%d]: %s = ???", i, info[i].key);
+		} else {
+			log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+				"info[%d]: %s = %s", i, info[i].key, val);
+			free(val);
+		}
+	}
+	/* Log the data */
+	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+			"Data size is %lu", ndata);
+	if (data && (ndata > 0))
+		log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+				"Data: %*s", ndata, data);
+	/* Log the callback */
 	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
 		"cbfunc %s NULL", cbfunc ? "is not" : "is");
 	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
 		"cbdata %s NULL", cbdata ? "is not" : "is");
+	/* Send IM_PMIX request to MS */
+	if ((pjob->ji_qs.ji_svrflags & JOB_SVFLG_HERE) != 0) {
+		/* This is MS, process locally */
+		/* TODO: local processing call */
+		log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+			"Collective operation requested on MS");
+	} else {
+		/* This is a sister, send a message to MS */
+		int stream = pjob->ji_hosts[0].hn_stream;
+		int ret;
+		pbs_task *ptask;
+		hnodent *pnode;
+		eventent *pevent;
+
+		log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+			"Collective operation requested on sister");
+		for (i = 0; i < pjob->ji_numnodes; i++) {
+			pnode = &pjob->ji_hosts[i];
+			if (pnode->hn_stream == stream)
+				break; /* this is me */
+		}
+		if (i >= pjob->ji_numnodes) {
+			log_event(PBSEVENT_DEBUG, 0, LOG_DEBUG, __func__,
+				"Failed to find local node in job");
+			return PMIX_ERROR;
+		}
+		/* Just use the first task ID we find */
+		ptask = (pbs_task *)GET_NEXT(pjob->ji_tasks);
+		if (!ptask) {
+			log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				pjob->ji_qs.ji_jobid, "No tasks found for job");
+			return PMIX_ERROR;
+		}
+		pevent = event_alloc(pjob, IM_PMIX, stream, pnode,
+			TM_NULL_EVENT, ptask->ti_qs.ti_task);
+		if (!pevent) {
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				pjob->ji_qs.ji_jobid, "Unable to allocate event");
+			return PMIX_ERROR;
+		}
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+			pjob->ji_qs.ji_jobid, "Allocated event %d for taskid %8.8X",
+			pevent->ee_event, ptask->ti_qs.ti_task);
+#if 0
+		/* XXX: Confirm the event was added */
+		{
+			eventent *ep;
+			log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				pjob->ji_qs.ji_jobid,
+				"Searching for event %d in taskid %8.8X",
+				pevent->ee_event, ptask->ti_qs.ti_task);
+			for (ep = (eventent *)GET_NEXT(pnode->hn_events); ep != NULL;
+					ep = (eventent *)GET_NEXT(ep->ee_next)) {
+				log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+					pjob->ji_qs.ji_jobid,
+					"Found event %d in taskid %8.8X",
+					ep->ee_event, ep->ee_taskid);
+				if (ep->ee_event == pevent->ee_event &&
+						ep->ee_taskid == ptask->ti_qs.ti_task) {
+					log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB,
+						LOG_DEBUG, pjob->ji_qs.ji_jobid,
+						"Found it!"); 
+					break;
+				}
+			}
+		}
+#endif
+		pjob->ji_taskid = ptask->ti_qs.ti_task;
+		pjob->ji_postevent = pevent->ee_event;
+		ret = im_compose(stream, pjob->ji_qs.ji_jobid,
+			pjob->ji_wattr[(int)JOB_ATR_Cookie].at_val.at_str,
+			IM_PMIX, pevent->ee_event, ptask->ti_qs.ti_task,
+			IM_OLD_PROTOCOL_VER);
+		if (ret != DIS_SUCCESS) {
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				pjob->ji_qs.ji_jobid,
+				"Failed to compose IM_PMIX message");
+			return PMIX_ERROR;
+		}
+		ret = diswst(stream, "FENCE");
+		if (ret != DIS_SUCCESS) {
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				pjob->ji_qs.ji_jobid,
+				"Failed to write IM_PMIX operation");
+			return PMIX_ERROR;
+		}
+#if 0
+		if (rpp_eom(stream) != 0) {
+			log_event(PBSEVENT_DEBUG, 0, LOG_DEBUG, __func__,
+				"Failed to complete IM_PMIX message");
+			return PMIX_ERROR;
+		}
+#endif
+		if (rpp_flush(stream) != 0) {
+			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				pjob->ji_qs.ji_jobid,
+				"Failed to flush IM_PMIX message");
+			return PMIX_ERROR;
+		}
+		log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+			"Sent IM_PMIX message to MS");
+	}
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
-	return PMIX_OPERATION_SUCCEEDED;
+	return PMIX_SUCCESS;
 }
 
 /**
@@ -494,7 +658,48 @@ pbs_pmix_direct_modex(
 	pmix_modex_cbfunc_t cbfunc,
 	void *cbdata)
 {
+	job *pjob;
+	int i;
+
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	if (!proc) {
+		log_err(-1, __func__, "pmix_proc_t parameter is NULL");
+		return PMIX_ERR_BAD_PARAM;
+	}
+	if (!proc->nspace || (*proc->nspace == '\0')) {
+		log_err(-1, __func__, "Invalid PMIx namespace");
+		return PMIX_ERR_BAD_PARAM;
+	}
+	pjob = find_job((char *)proc->nspace);
+	if (!pjob) {
+		snprintf(log_buffer, sizeof(log_buffer),
+			"Job not found: %s", proc->nspace);
+		log_err(-1, __func__, log_buffer);
+		return PMIX_ERR_BAD_PARAM;
+	}
+	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+		"proc->nspace = %s", proc->nspace);
+	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+		"proc->rank = %s", rank2text((unsigned int)proc->rank));
+	/* Log the info array */
+	log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+			"Info count is %lu", ninfo);
+	for (i = 0; i < ninfo; i++) {
+		char *val;
+		pmix_status_t rc;
+
+		val = NULL;
+		rc = PMIx_Data_print(&val, NULL, (void *)&info[i].value,
+			info[i].value.type);
+		if (!val || (rc != PMIX_SUCCESS)) {
+			log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+				"info[%d]: %s = ???", i, info[i].key);
+		} else {
+			log_eventf(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
+				"info[%d]: %s = %s", i, info[i].key, val);
+			free(val);
+		}
+	}
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
 	return PMIX_ERR_NOT_IMPLEMENTED;
 }
@@ -697,6 +902,10 @@ pbs_pmix_disconnect(
 	void *cbdata)
 {
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	/*
+	 * PRRTE makes a call to the fence handler before exiting and
+	 * returns whatever result the hadnler returned.
+	 */
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
 	return PMIX_ERR_NOT_IMPLEMENTED;
 }
@@ -783,7 +992,7 @@ pbs_pmix_deregister_events(
 void
 pbs_pmix_server_init(char *name)
 {
-	pmix_status_t pstat;
+	pmix_status_t rc;
 	pmix_server_module_t pbs_pmix_server_module = {
 		/* v1x interfaces */
 		.client_connected = pbs_pmix_client_connected,
@@ -826,12 +1035,12 @@ pbs_pmix_server_init(char *name)
 #endif
 	};
 
-	pstat = PMIx_server_init(&pbs_pmix_server_module, NULL, 0);
-	if (pstat != PMIX_SUCCESS) {
+	rc = PMIx_server_init(&pbs_pmix_server_module, NULL, 0);
+	if (rc != PMIX_SUCCESS) {
 		log_eventf(PBSEVENT_ERROR, PBS_EVENTCLASS_SERVER,
 			LOG_ERR, name,
 			"Could not initialize PMIx server: %s",
-			PMIx_Error_string(pstat));
+			PMIx_Error_string(rc));
 	} else {
 		log_event(PBSEVENT_DEBUG, PBS_EVENTCLASS_SERVER,
 			LOG_DEBUG, name, "PMIx server initialized");
@@ -877,7 +1086,7 @@ void
 pbs_pmix_register_client(job *pjob, int tvnodeid, char ***envpp)
 {
 	char **ep;
-	pmix_status_t pstat;
+	pmix_status_t rc;
 	pmix_proc_t pproc;
 	int before, after;
 	pbs_pmix_lock_t pmix_lock;
@@ -897,17 +1106,17 @@ pbs_pmix_register_client(job *pjob, int tvnodeid, char ***envpp)
 	/* Rank is based on tvnodeid */
 	PMIX_LOAD_PROCID(&pproc, pjob->ji_qs.ji_jobid, tvnodeid);
 	PBS_PMIX_CONSTRUCT_LOCK(&pmix_lock);
-	pstat = PMIx_server_register_client(&pproc,
+	rc = PMIx_server_register_client(&pproc,
 			pjob->ji_qs.ji_un.ji_momt.ji_exuid,
 			pjob->ji_qs.ji_un.ji_momt.ji_exgid,
 			NULL, pbs_pmix_wait_cb, (void *)&pmix_lock);
 	PBS_PMIX_WAIT_THREAD(&pmix_lock);
 	PBS_PMIX_DESTRUCT_LOCK(&pmix_lock);
-	if (pstat != PMIX_SUCCESS) {
+	if (rc != PMIX_SUCCESS) {
 		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
 			pjob->ji_qs.ji_jobid,
 			"Failed to register PMIx client: %s",
-			PMIx_Error_string(pstat));
+			PMIx_Error_string(rc));
 		return;
 	}
 	log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
@@ -919,12 +1128,12 @@ pbs_pmix_register_client(job *pjob, int tvnodeid, char ***envpp)
 		"Setting up PMIx fork for client %d", tvnodeid);
 	/* Allow PMIx to add required environment variables */
 	for (before = 0, ep = *envpp; ep && *ep; before++, ep++) {}
-	pstat = PMIx_server_setup_fork(&pproc, envpp);
-	if (pstat != PMIX_SUCCESS) {
+	rc = PMIx_server_setup_fork(&pproc, envpp);
+	if (rc != PMIX_SUCCESS) {
 		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
 			pjob->ji_qs.ji_jobid,
 			"Failed to setup PMIx server fork: %s",
-			PMIx_Error_string(pstat));
+			PMIx_Error_string(rc));
 		return;
 	}
 	for (after = 0, ep = *envpp; ep && *ep; after++, ep++) {}
@@ -1191,7 +1400,7 @@ static void
 pbs_pmix_register_namespace(job *pjob)
 {
 	pmix_info_t *pinfo;
-	pmix_status_t pstat;
+	pmix_status_t rc;
 	pmix_rank_t rank;
 	pbs_pmix_lock_t pmix_lock;
 	char *pmix_node_list = NULL;
@@ -1201,7 +1410,7 @@ pbs_pmix_register_namespace(job *pjob)
 	char *pmix_ppn_regex;
 	int loc_size;
 	int msnlen;
-	int rc;
+	int ret;
 	int i, n, ninfo;
 	uint32_t ui, pmix_node_ct, pmix_node_idx;
 
@@ -1211,10 +1420,10 @@ pbs_pmix_register_namespace(job *pjob)
 			NULL, "Invalid job pointer");
 		return;
 	}
-	rc = pbs_pmix_gen_map(pjob, &pmix_node_list,
+	ret = pbs_pmix_gen_map(pjob, &pmix_node_list,
 			&pmix_node_ct, &pmix_node_idx,
 			&pmix_ppn_list, &pmix_ppn_local);
-	if (rc != 0) {
+	if (ret != 0) {
 		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_ERR,
 			pjob->ji_qs.ji_jobid,
 			"Failed to generate PMIx mapping");
@@ -1393,16 +1602,16 @@ pbs_pmix_register_namespace(job *pjob)
 	PBS_PMIX_CONSTRUCT_LOCK(&pmix_lock);
 	log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
 		pjob->ji_qs.ji_jobid, "Registering PMIx namespace");
-	pstat = PMIx_server_register_nspace(pjob->ji_qs.ji_jobid, loc_size,
+	rc = PMIx_server_register_nspace(pjob->ji_qs.ji_jobid, loc_size,
 			pinfo, ninfo, pbs_pmix_wait_cb, (void *)&pmix_lock);
 	PBS_PMIX_WAIT_THREAD(&pmix_lock);
 	PBS_PMIX_DESTRUCT_LOCK(&pmix_lock);
 	PMIX_INFO_FREE(pinfo, ninfo);
-	if (pstat != PMIX_SUCCESS) {
+	if (rc != PMIX_SUCCESS) {
 		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
 			pjob->ji_qs.ji_jobid,
 			"Failed to register PMIx namespace: %s",
-			PMIx_Error_string(pstat));
+			PMIx_Error_string(rc));
 	} else {
 		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
 			pjob->ji_qs.ji_jobid, "PMIx namespace registered");
@@ -1468,6 +1677,36 @@ pbs_pmix_job_clean_extra(job *pjob)
 {
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
 	pbs_pmix_deregister_namespace(pjob);
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+	return 0;
+}
+
+/*
+ * @brief
+ * Register an IM_PMIX event
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] stream - Stream to MS
+ * @param[in] pjob - pointer to job structure
+ * @param[in] cookie - job cookie
+ * @param[in] event - event
+ * @param[in] taskid - task ID
+ *
+ * @return int
+ * @retval 0 - success
+ * @retval -1 - failure
+ */
+int
+pbs_pmix_register_request(
+	char *oper,
+	int stream,
+	job *pjob,
+	char *cookie,
+	tm_event_t event,
+	tm_task_id taskid)
+{
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	/* Validate the parameters and call the appropriate handler */
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
 	return 0;
 }

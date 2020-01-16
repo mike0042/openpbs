@@ -59,13 +59,16 @@ extern void
 pbs_pmix_register_client(job *, int, char ***);
 
 extern void
-pbs_pmix_notify_exit(job *pjob, int exitstat, char *msg);
+pbs_pmix_notify_exit(job *, int, char *);
 
 extern int
 pbs_pmix_job_join_extra(job *, hnodent *);
 
 extern int
 pbs_pmix_job_clean_extra(job *);
+
+extern int
+pbs_pmix_register_request(char *, int, job *, char *, tm_event_t, tm_task_id);
 
 #endif /* PMIX */
 

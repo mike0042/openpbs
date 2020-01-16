@@ -3575,13 +3575,17 @@ join_err:
 				goto err;
 			}
 		}
-		ep = (eventent *)GET_NEXT(np->hn_events);
 
-		while (ep) {
-			if (ep->ee_event == event &&
-				ep->ee_taskid == fromtask)
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+			jobid, "Searching for event %d in taskid %8.8X",
+			event, fromtask);
+		for (ep = (eventent *)GET_NEXT(np->hn_events); ep != NULL;
+				ep = (eventent *)GET_NEXT(ep->ee_next)) {
+			log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+				jobid, "Found event %d in taskid %8.8X",
+				ep->ee_event, ep->ee_taskid);
+			if (ep->ee_event == event && ep->ee_taskid == fromtask)
 				break;
-			ep = (eventent *)GET_NEXT(ep->ee_next);
 		}
 		if (ep == NULL) {
 			if (pjob->ji_updated)  {
@@ -3590,7 +3594,7 @@ join_err:
 				 */
 				goto done;
 			} else {
-				sprintf(log_buffer, "event %d taskid %8.8X not found",
+				sprintf(log_buffer, "event %d in taskid %8.8X not found",
 					event, fromtask);
 				goto err;
 			}
@@ -4250,25 +4254,30 @@ join_err:
 			 * be carried out.
 			 *
 			 * auxiliary info (
-			 *	sending node	tm_node_id;
-			 *	taskid		tm_task_id;
 			 *	operation	string;
 			 * )
 			 */
 			sprintf(log_buffer, "IM_PMIX request received");
 			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
 				jobid, log_buffer);
-			/* TODO: Read aux info, processes request, and send response */
-			sprintf(log_buffer, "Handle IM_PMIX request");
-			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
-				jobid, log_buffer);
-			sprintf(log_buffer, "IM_PMIX replying IM_ALL_OK");
-			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
-				jobid, log_buffer);
+			name = disrst(stream, &ret);
+			BAIL("PMIX operation")
+			log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG, jobid,
+				"PMIX %s request from event %d in taskid %8.8X",
+				name, event, fromtask);
+			/* Register the request */
+			ret = pbs_pmix_register_request(name, stream, pjob, cookie,
+							event, fromtask);
+			if (ret != 0) {
+				SEND_ERR(PBSE_IVALREQ)
+				break;
+			}
+			/* Acknowledge the request */
 			ret = im_compose(stream, jobid, cookie, IM_ALL_OKAY,
 				event, fromtask, IM_OLD_PROTOCOL_VER);
 			if (ret != DIS_SUCCESS)
 				break;
+			ret = diswst(stream, name);
 			break;
 #endif
 
@@ -4960,26 +4969,44 @@ join_err:
 #ifdef PMIX
 				case	IM_PMIX:
 					/*
-					 * I must be mother superior for the job and
-					 * this is a reply for a PMIX operation.
+					 * Sender is mother superior acknowleding my
+					 * request for a PMIX operation.
 					 *
 					 * auxiliary info (
-					 *	operation	int;
+					 *	info	string;
 					 * )
 					 */
-					sprintf(log_buffer, "IM_PMIX reply received");
-					log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
-						jobid, log_buffer);
-					if ((pjob->ji_qs.ji_svrflags & JOB_SVFLG_HERE) == 0) {
+					info = disrst(stream, &ret);
+					BAIL("OK-PMIX info")
+					DBPRT(("%s: %s PMIX %8.8X OKAY\n",
+						__func__, jobid, event_task))
+#if 0
+					ptask = task_check(pjob, efd, event_task);
+					if (ptask == NULL) {
+						log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB,
+							LOG_DEBUG, jobid,
+							"IM_PMIX bad task");
+						break;
+					}
+#endif
+					log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
+						jobid, "IM_PMIX reply for %s received from MS "
+						"for task %8.8X", info, event_task);
+					if ((pjob->ji_qs.ji_svrflags & JOB_SVFLG_HERE) == 1) {
 						sprintf(log_buffer,
-							"Received IM_PMIX reply "
-							"and this is not MS");
+							"Should not receive IM_PMIX reply "
+							"on MS");
 						goto err;
 					}
 					/* TODO: Handle IM_PMIX reply */
-					sprintf(log_buffer, "Handle IM_PMIX reply here");
 					log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
-						jobid, log_buffer);
+						jobid, "Handle IM_PMIX reply from MS here");
+#if 0
+					(void)tm_reply(efd, ptask->ti_protover,
+						TM_OKAY, event_client);
+					(void)diswst(efd, info);
+					(void)DIS_tcp_wflush(efd);
+#endif
 					break;
 #endif /* PMIX */
 
@@ -5401,9 +5428,8 @@ join_err:
 						goto err;
 					}
 					/* TODO: Handle IM_PMIX error */
-					sprintf(log_buffer, "Handle IM_PMIX error here");
 					log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
-						jobid, log_buffer);
+						jobid, "Handle IM_PMIX error here");
 					break;
 #endif /* PMIX */
 
@@ -5418,6 +5444,7 @@ join_err:
 							  LOG_INFO, jobid, errmsg);
 					}
 					break;
+
 				default:
 					sprintf(log_buffer, "unknown command %d error",
 						event_com);
