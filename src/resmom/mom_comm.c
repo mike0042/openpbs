@@ -4266,7 +4266,7 @@ join_err:
 				"PMIX %s request from event %d in taskid %8.8X",
 				name, event, fromtask);
 			/* Register the request */
-			ret = pbs_pmix_register_request(name, stream, pjob, cookie,
+			ret = pbs_pmix_register_stream(name, stream, pjob, cookie,
 							event, fromtask);
 			if (ret != 0) {
 				SEND_ERR(PBSE_IVALREQ)
@@ -4279,7 +4279,7 @@ join_err:
 				break;
 			ret = diswst(stream, name);
 			break;
-#endif
+#endif /* PMIX */
 
 		case	IM_SUSPEND:
 		case	IM_RESUME:
@@ -5001,6 +5001,7 @@ join_err:
 					/* TODO: Handle IM_PMIX reply */
 					log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
 						jobid, "Handle IM_PMIX reply from MS here");
+					pbs_pmix_fence_release(pjob, event_task);
 #if 0
 					(void)tm_reply(efd, ptask->ti_protover,
 						TM_OKAY, event_client);

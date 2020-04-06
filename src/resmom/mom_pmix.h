@@ -52,6 +52,12 @@ extern "C" {
 #include <pmix_server.h>
 #include "job.h"
 
+extern int
+pbs_pmix_register_stream(char *, int, job *, char *, tm_event_t, tm_task_id);
+
+extern void
+pbs_pmix_fence_release(job *, tm_task_id);
+
 extern void
 pbs_pmix_server_init(char *);
 
@@ -66,9 +72,6 @@ pbs_pmix_job_join_extra(job *, hnodent *);
 
 extern int
 pbs_pmix_job_clean_extra(job *);
-
-extern int
-pbs_pmix_register_request(char *, int, job *, char *, tm_event_t, tm_task_id);
 
 #endif /* PMIX */
 

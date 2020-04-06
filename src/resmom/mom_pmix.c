@@ -59,15 +59,12 @@
 #include "log.h"
 #include "tm.h"
 #include "net_connect.h"
-#include "rpp.h"
 #include "dis.h"
 
 extern char *log_file;
 extern char *path_log;
 extern char mom_short_name[];
 extern pbs_list_head svr_alljobs;
-
-#if 0
 
 /*
  * Some operations like spawn and fence are not atomic and occur
@@ -79,27 +76,48 @@ extern pbs_list_head svr_alljobs;
  * implemented) here.
  */
 
-/* Enumerate operations that require PBS to call back */
-typedef enum pbs_pmix_oper_type {
-	PBS_PMIX_OPER_NONE,
-	PBS_PMIX_FENCE,
-	PBS_PMIX_SPAWN,
-	/* Add new operations before PBS_PMIX_OPER_UNDEFINED */
-	PBS_PMIX_OPER_UNDEFINED
-} pbs_pmix_oper_type_t;
+#define PBS_PMIX_FENCE "FENCE"
+#define PBS_PMIX_SPAWN "SPAWN"
 
-/* Data structure to house auxiliary PMIx operation data */
-typedef struct pbs_pmix_oper {
-	pbs_pmix_oper_type_t type;
-	job *pjob;
-	struct pbs_pmix_oper *next;
-	union {
-		pbs_pmix_fence_data_t fence;
-		pbs_pmix_spawn_data_t spawn;
-	} data;
+/* Enumerate operations that require PBS to call back */
+typedef enum pbs_pmix_oper {
+	PBS_PMIX_OPER_NONE,
+	PBS_PMIX_OPER_FENCE,
+	PBS_PMIX_OPER_SPAWN
 } pbs_pmix_oper_t;
 
-#endif
+/* Data structure to house PMIx request data on sister */
+typedef struct pbs_pmix_sis {
+	pbs_pmix_oper_t oper;
+	job *pjob;
+	tm_event_t event;
+	tm_task_id taskid;
+	char *data;
+	size_t ndata;
+	pmix_modex_cbfunc_t cbfunc;
+	void *cbdata;
+	struct pbs_pmix_sis *next;
+} pbs_pmix_sis_t;
+
+/* Head of list for local operations awaiting response */
+static pbs_pmix_sis_t *pbs_pmix_sis_head = NULL;
+
+typedef struct pbs_pmix_ms {
+	pbs_pmix_oper_t oper;
+	job *pjob;
+	tm_event_t event;
+	tm_task_id taskid;
+	char *data;
+	size_t ndata;
+	pmix_modex_cbfunc_t cbfunc;
+	void *cbdata;
+	int stream;
+	char *cookie;
+	struct pbs_pmix_ms *next;
+} pbs_pmix_ms_t;
+
+/* Head of list for requests where local node is MS */
+static pbs_pmix_ms_t *pbs_pmix_ms_head = NULL;
 
 /* Locking structure and macros */
 typedef struct {
@@ -139,6 +157,48 @@ typedef struct {
 		pthread_cond_broadcast(&(lck)->cond); \
 		pthread_mutex_unlock(&(lck)->mutex); \
 	} while(0)
+
+/**
+ * @brief
+ * Given a numeric identifier, return the associated operation string.
+ *
+ * @param[in] oper - numeric value of operation to convert
+ *
+ * @return char *
+ * @retval String representation of operation
+ */
+static char *
+oper2text(int oper)
+{
+	switch(oper) {
+	case PBS_PMIX_OPER_FENCE:
+		return PBS_PMIX_FENCE;
+	case PBS_PMIX_OPER_SPAWN:
+		return PBS_PMIX_SPAWN;
+	default:
+		return NULL;
+	}
+}
+
+/**
+ * @brief
+ * Given a string identifier, return the associated numeric identifier.
+ * values with special meaning.
+ *
+ * @param[in] oper - string value of operation to convert
+ *
+ * @return int
+ * @retval Numeric representation of operation
+ */
+static int
+text2oper(char *oper)
+{
+	if (!strcmp(oper, PBS_PMIX_FENCE))
+		return PBS_PMIX_OPER_FENCE;
+	if (!strcmp(oper, PBS_PMIX_SPAWN))
+		return PBS_PMIX_OPER_SPAWN;
+	return PBS_PMIX_OPER_NONE;
+}
 
 /**
  * @brief
@@ -182,6 +242,363 @@ rank2text(unsigned int rank)
 	return rankbuf;
 }
 
+/**
+ * @brief
+ * Find an entry in the server list
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] jobid - job ID
+ * @param[in] event - event ID
+ * @param[in] taskid - task ID
+ *
+ * @return *pbs_pmix_ms_t
+ * @retval !NULL - pointer to server list entry
+ * @retval NULL - not found
+ */
+static pbs_pmix_ms_t *
+pbs_pmix_find_ms_entry(
+	pbs_pmix_oper_t oper,
+	job *pjob,
+	tm_event_t event,
+	tm_task_id taskid)
+{
+	pbs_pmix_ms_t *pms;
+
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	for (pms = pbs_pmix_ms_head; pms; pms = pms->next) {
+		if (pms->oper != oper)
+			continue;
+		if (pms->event != event)
+			continue;
+		if (pms->taskid != taskid)
+			continue;
+		if (!pms->pjob || !pjob)
+			continue;
+		if (pms->pjob != pjob)
+			continue;
+		return pms;
+	}
+	return NULL;
+}
+
+/**
+ * @brief
+ * Allocate and append a new entry to the local list
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] pjob - pointer to job structure
+ * @param[in] event - event ID
+ * @param[in] taskid - task ID
+ * @param[in] data - Data supplied to callback
+ * @param[in] ndata - Number of data entries
+ * @param[in] cbfunc - Pointer to callback function
+ * @param[in] cbdata - Additional data for callback
+ *
+ * @return *pbs_pmix_sis_t
+ * @retval NULL - failure
+ * @retval !NULL - pointer to new entry
+ */
+static pbs_pmix_sis_t *
+pbs_pmix_sis_append(
+	pbs_pmix_oper_t oper,
+	job *pjob,
+	tm_event_t event,
+	tm_task_id taskid,
+	char *data,
+	size_t ndata,
+	pmix_modex_cbfunc_t cbfunc,
+	void *cbdata)
+{
+	pbs_pmix_sis_t *psis, *psisprev;
+
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	/* Check to see if the entry exists or find the end of list */
+	for (psisprev = NULL, psis = pbs_pmix_sis_head; psis;
+			psisprev = psis, psis = psis->next) {
+		if (psis->oper != oper)
+			continue;
+		if (psis->event != event)
+			continue;
+		if (psis->taskid != taskid)
+			continue;
+		if (psis->pjob != pjob)
+			continue;
+		break;
+	}
+	if (psis) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Duplicate entry for sister operation %s", oper2text(oper));
+		return NULL;
+	}
+	psis = calloc(1, sizeof(pbs_pmix_sis_t));
+	if (!psis) {
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Failed to allocate sister entry");
+		return NULL;
+	}
+	psis->oper = oper;
+	psis->pjob = pjob;
+	psis->event = event;
+	psis->taskid = taskid;
+	psis->data = data;
+	psis->ndata = ndata;
+	psis->cbfunc = cbfunc;
+	psis->cbdata = cbdata;
+	psis->next = NULL;
+	psisprev->next = psis;
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+	return psis;
+}
+
+/**
+ * @brief
+ * Allocate and append a new entry to the mother superior list
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] pjob - pointer to job structure
+ * @param[in] data - Data supplied to callback
+ * @param[in] ndata - Number of data entries
+ * @param[in] cbfunc - Pointer to callback function
+ * @param[in] cbdata - Additional data for callback
+ *
+ * @return *pbs_pmix_ms_t
+ * @retval NULL - failure
+ * @retval !NULL - pointer to new entry
+ */
+static pbs_pmix_ms_t *
+pbs_pmix_ms_append(
+	pbs_pmix_oper_t oper,
+	job *pjob,
+	char *data,
+	size_t ndata,
+	pmix_modex_cbfunc_t cbfunc,
+	void *cbdata)
+{
+	pbs_pmix_ms_t *pms, *pmsprev;
+
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	/* Check to see if the entry exists or find the end of list */
+	for (pmsprev = NULL, pms = pbs_pmix_ms_head; pms;
+			pmsprev = pms, pms = pms->next) {
+		if (pms->oper != oper)
+			continue;
+		if (pms->pjob != pjob)
+			continue;
+		break;
+	}
+	if (pms) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Duplicate entry for mother superior operation %s",
+			oper2text(oper));
+		return NULL;
+	}
+	pms = calloc(1, sizeof(pbs_pmix_ms_t));
+	if (!pms) {
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Failed to allocate mother superior entry");
+		return NULL;
+	}
+	pms->oper = oper;
+	pms->pjob = pjob;
+	pms->data = data;
+	pms->ndata = ndata;
+	pms->cbfunc = cbfunc;
+	pms->cbdata = cbdata;
+	pms->next = NULL;
+	pmsprev->next = pms;
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+	return pms;
+}
+
+/**
+ * @brief
+ * Add stream data to IM_PMIX request
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] stream - Stream to MS
+ * @param[in] pjob - pointer to job structure
+ * @param[in] cookie - job cookie
+ * @param[in] event - event ID
+ * @param[in] taskid - task ID
+ *
+ * @return int
+ * @retval 0 - success
+ * @retval -1 - failure
+ */
+int
+pbs_pmix_register_stream(
+	char *opstr,
+	int stream,
+	job *pjob,
+	char *cookie,
+	tm_event_t event,
+	tm_task_id taskid)
+{
+	pbs_pmix_oper_t oper;
+	pbs_pmix_ms_t *pms;
+
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	/* Find the request in the server list */
+	oper = text2oper(opstr);
+	if (oper == PBS_PMIX_OPER_NONE) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Invalid PMIX operation: %s", opstr);
+		return -1;
+	}
+	pms = pbs_pmix_find_ms_entry(oper, pjob, event, taskid);
+	if (!pms) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Entry not found for %s operation with taskid %8.8X",
+			opstr, taskid);
+		return -1;
+	}
+	/* Add a stream data to entry */
+	pms->cookie = strdup(cookie);
+	if (!pms->cookie) {
+		log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Failed to copy cookie");
+		return -1;
+	}
+	pms->stream = stream;
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+	return 0;
+}
+
+/**
+ * @brief
+ * Register an IM_PMIX request on a sister node
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] pjob - pointer to job structure
+ * @param[in] event - event ID
+ * @param[in] taskid - task ID
+ * @param[in] data - Data supplied to callback
+ * @param[in] ndata - Number of data entries
+ * @param[in] cbfunc - Pointer to callback function
+ * @param[in] cbdata - Additional data for callback
+ *
+ * @return int
+ * @retval 0 - success
+ * @retval -1 - failure
+ */
+static int
+pbs_pmix_register_req_on_sis(
+	char *opstr,
+	job *pjob,
+	tm_event_t event,
+	tm_task_id taskid,
+	char *data,
+	size_t ndata,
+	pmix_modex_cbfunc_t cbfunc,
+	void *cbdata)
+{
+	pbs_pmix_oper_t oper;
+	pbs_pmix_sis_t *psis;
+
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid,
+		"Registering PMIx %s operation for event %d, taskid %8.8X",
+		opstr, event, taskid);
+	/* Validate the parameters */
+	oper = text2oper(opstr);
+	if (oper == PBS_PMIX_OPER_NONE) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Invalid PMIX operation: %s", opstr);
+		return -1;
+	}
+	/* Add entry to the local operation list */
+	psis = pbs_pmix_sis_append(oper, pjob, event, taskid,
+			data, ndata, cbfunc, cbdata);
+	if (!psis) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Failed to append operation entry for %s", opstr);
+		return -1;
+	}
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+	return 0;
+}
+
+/**
+ * @brief
+ * Register an IM_PMIX request on mother superior
+ *
+ * @param[in] oper - PMIX operation name
+ * @param[in] pjob - pointer to job structure
+ *
+ * @return int
+ * @retval 0 - success
+ * @retval -1 - failure
+ */
+static int
+pbs_pmix_register_req_on_ms(
+	char *opstr,
+	job *pjob,
+	char *data,
+	size_t ndata,
+	pmix_modex_cbfunc_t cbfunc,
+	void *cbdata)
+{
+	pbs_pmix_oper_t oper;
+	pbs_pmix_ms_t *pms;
+
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid,
+		"MS registering PMIx %s operation for event %d, taskid %8.8X",
+		opstr, pjob->ji_postevent, pjob->ji_taskid);
+	/* Validate the parameters */
+	oper = text2oper(opstr);
+	if (oper == PBS_PMIX_OPER_NONE) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Invalid PMIX operation: %s", opstr);
+		return -1;
+	}
+	/* Add entry to the local operation list */
+	pms = pbs_pmix_ms_append(oper, pjob, data, ndata, cbfunc, cbdata);
+	if (!pms) {
+		log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+			pjob->ji_qs.ji_jobid,
+			"Failed to append operation entry for %s", opstr);
+		return -1;
+	}
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+	return 0;
+}
+
+/**
+ * @brief
+ * Release a pending FENCE
+ *
+ * @param[in] pjob - pointer to job structure
+ * @param[in] taskid - associated task ID
+ *
+ * @return void
+ */
+void
+pbs_pmix_fence_release(job *pjob, tm_task_id taskid)
+{
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
+	log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_INFO,
+		pjob->ji_qs.ji_jobid,
+		"Releasing PMIx fence for taskid %8.8X", taskid);
+	/* Find the entry in the client list */
+	/* Make the callback */
+	/* Cleanup */
+	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
+}
+
+#endif /* PMIX */
 /**
  * @brief
  * This callback function is invoked by the PMIx library after it
@@ -530,9 +947,10 @@ pbs_pmix_fence_nb(
 	/* Send IM_PMIX request to MS */
 	if ((pjob->ji_qs.ji_svrflags & JOB_SVFLG_HERE) != 0) {
 		/* This is MS, process locally */
-		/* TODO: local processing call */
 		log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__,
 			"Collective operation requested on MS");
+		pbs_pmix_register_req_on_ms(PBS_PMIX_FENCE, pjob,
+			data, ndata, cbfunc, cbdata);
 	} else {
 		/* This is a sister, send a message to MS */
 		int stream = pjob->ji_hosts[0].hn_stream;
@@ -554,6 +972,7 @@ pbs_pmix_fence_nb(
 			return PMIX_ERROR;
 		}
 		/* Just use the first task ID we find */
+		/* TODO: May not be the right one with multiple jobs */
 		ptask = (pbs_task *)GET_NEXT(pjob->ji_tasks);
 		if (!ptask) {
 			log_eventf(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
@@ -596,6 +1015,11 @@ pbs_pmix_fence_nb(
 #endif
 		pjob->ji_taskid = ptask->ti_qs.ti_task;
 		pjob->ji_postevent = pevent->ee_event;
+		/* Record details needed when the response arrives */
+		pbs_pmix_register_req_on_sis(PBS_PMIX_FENCE, pjob,
+			pevent->ee_event, ptask->ti_qs.ti_task,
+			data, ndata, cbfunc, cbdata);
+		/* Send IM_PMIX message to MS */
 		ret = im_compose(stream, pjob->ji_qs.ji_jobid,
 			pjob->ji_wattr[(int)JOB_ATR_Cookie].at_val.at_str,
 			IM_PMIX, pevent->ee_event, ptask->ti_qs.ti_task,
@@ -606,7 +1030,7 @@ pbs_pmix_fence_nb(
 				"Failed to compose IM_PMIX message");
 			return PMIX_ERROR;
 		}
-		ret = diswst(stream, "FENCE");
+		ret = diswst(stream, PBS_PMIX_FENCE);
 		if (ret != DIS_SUCCESS) {
 			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
 				pjob->ji_qs.ji_jobid,
@@ -614,13 +1038,13 @@ pbs_pmix_fence_nb(
 			return PMIX_ERROR;
 		}
 #if 0
-		if (rpp_eom(stream) != 0) {
+		if (tpp_eom(stream) != 0) {
 			log_event(PBSEVENT_DEBUG, 0, LOG_DEBUG, __func__,
 				"Failed to complete IM_PMIX message");
 			return PMIX_ERROR;
 		}
 #endif
-		if (rpp_flush(stream) != 0) {
+		if (dis_flush(stream) != 0) {
 			log_event(PBSEVENT_JOB, PBS_EVENTCLASS_JOB, LOG_DEBUG,
 				pjob->ji_qs.ji_jobid,
 				"Failed to flush IM_PMIX message");
@@ -1681,34 +2105,3 @@ pbs_pmix_job_clean_extra(job *pjob)
 	return 0;
 }
 
-/*
- * @brief
- * Register an IM_PMIX event
- *
- * @param[in] oper - PMIX operation name
- * @param[in] stream - Stream to MS
- * @param[in] pjob - pointer to job structure
- * @param[in] cookie - job cookie
- * @param[in] event - event
- * @param[in] taskid - task ID
- *
- * @return int
- * @retval 0 - success
- * @retval -1 - failure
- */
-int
-pbs_pmix_register_request(
-	char *oper,
-	int stream,
-	job *pjob,
-	char *cookie,
-	tm_event_t event,
-	tm_task_id taskid)
-{
-	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "called");
-	/* Validate the parameters and call the appropriate handler */
-	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
-	return 0;
-}
-
-#endif /* PMIX */
