@@ -598,7 +598,6 @@ pbs_pmix_fence_release(job *pjob, tm_task_id taskid)
 	log_event(PBSEVENT_DEBUG3, 0, LOG_DEBUG, __func__, "returning");
 }
 
-#endif /* PMIX */
 /**
  * @brief
  * This callback function is invoked by the PMIx library after it
@@ -2105,3 +2104,4 @@ pbs_pmix_job_clean_extra(job *pjob)
 	return 0;
 }
 
+#endif /* PMIX */
