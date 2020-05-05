@@ -39,6 +39,9 @@
 pbshooksdir = $(libdir)/python/altair/pbs_hooks
 
 dist_pbshooks_DATA = \
+	cgroups/pbs_cgroups.CF \
 	cgroups/pbs_cgroups.HK \
 	cgroups/pbs_cgroups.PY \
-	cgroups/pbs_cgroups.CF
+	prte/pbs_prte.CF \
+	prte/pbs_prte.HK \
+	prte/pbs_prte.PY
