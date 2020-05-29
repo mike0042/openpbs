@@ -80,8 +80,6 @@
 %define have_systemd 1
 %endif
 
-%global __python %{__python3}
-
 Name: %{pbs_name}
 Version: %{pbs_version}
 Release: %{pbs_release}
@@ -135,10 +133,6 @@ BuildRequires: openssl-devel
 BuildRequires: libXext
 BuildRequires: libXft
 %endif
-
-# Pure python extensions use the 32 bit library path
-%{!?py_site_pkg_32: %global py_site_pkg_32 %(%{__python} -c "from distutils.sysconfig import get_python_lib; print(get_python_lib(0))")}
-%{!?py_site_pkg_64: %global py_site_pkg_64 %(%{__python} -c "from distutils.sysconfig import get_python_lib; print(get_python_lib(1))")}
 
 %description
 OpenPBS is a fast, powerful workload manager and
